@@ -14,7 +14,7 @@ import { studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
 import { setPositionInstruction } from "../state.js";
 
-import { getPoolMemory, addPoolNote } from "../pool-memory.js";
+import { getPoolMemory, addPoolNote, isPoolOnCooldown, isBaseMintOnCooldown } from "../pool-memory.js";
 import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
 import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-blacklist.js";
 import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
@@ -403,6 +403,22 @@ async function runSafetyChecks(name, args) {
             reason: `Already holding base token ${args.base_mint} in another pool. One position per token only.`,
           };
         }
+      }
+
+      // Check pool cooldown (prevents rapid re-entry into same pool after close)
+      if (isPoolOnCooldown(args.pool_address)) {
+        return {
+          pass: false,
+          reason: `Pool ${args.pool_address} is in cooldown. Repeated re-entry into the same pool erodes profits.`,
+        };
+      }
+
+      // Check base mint cooldown (prevents re-entry into same token via different pool)
+      if (args.base_mint && isBaseMintOnCooldown(args.base_mint)) {
+        return {
+          pass: false,
+          reason: `Token ${args.base_mint} is in cooldown. Avoid re-entering same token too quickly.`,
+        };
       }
 
       // Check amount limits

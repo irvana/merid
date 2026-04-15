@@ -148,13 +148,38 @@ export function recordPoolDeploy(poolAddress, deployData) {
     entry.base_mint = deployData.base_mint;
   }
 
-  // Set cooldown for low yield closes — pool wasn't profitable enough, don't redeploy soon
-  if (deploy.close_reason === "low yield") {
-    const cooldownHours = 4;
-    const cooldownUntil = setPoolCooldown(entry, cooldownHours, "low yield");
+  // ── Cooldown logic ──────────────────────────────────────────────
+  // Configurable cooldown hours (user-config.json or defaults)
+  const reEntryCooldownHours  = config.management.poolReentryCooldownHours ?? 4;
+  const slCooldownHours       = config.management.poolSlCooldownHours ?? 8;
+
+  const closeReasonLower = String(deploy.close_reason || "").toLowerCase();
+
+  // 1. Stop loss — long cooldown on both pool AND token (prevent re-entry via different pool)
+  if (closeReasonLower.includes("stop loss")) {
+    const poolCd = setPoolCooldown(entry, slCooldownHours, "stop loss");
+    const mintCd = setBaseMintCooldown(db, entry.base_mint, slCooldownHours, "stop loss");
+    log("pool-memory", `SL cooldown set for ${entry.name} until ${poolCd}`);
+    if (entry.base_mint && mintCd) {
+      log("pool-memory", `SL token cooldown set for ${entry.base_mint.slice(0, 8)} until ${mintCd}`);
+    }
+  }
+  // 2. Low yield — medium cooldown (existing behavior)
+  else if (deploy.close_reason === "low yield") {
+    const cooldownUntil = setPoolCooldown(entry, 4, "low yield");
     log("pool-memory", `Cooldown set for ${entry.name} until ${cooldownUntil} (low yield close)`);
   }
+  // 3. General re-entry cooldown — applies to ALL closes (profit or loss)
+  //    Prevents the "enter-profit-reenter-profit-reenter-SL" pattern
+  else {
+    const currentCooldown = entry.cooldown_until ? new Date(entry.cooldown_until) : null;
+    if (!currentCooldown || currentCooldown <= new Date()) {
+      const cooldownUntil = setPoolCooldown(entry, reEntryCooldownHours, "re-entry cooldown");
+      log("pool-memory", `Re-entry cooldown set for ${entry.name} until ${cooldownUntil}`);
+    }
+  }
 
+  // 4. Repeated OOR closes — long cooldown on both pool and token
   const oorTriggerCount = config.management.oorCooldownTriggerCount ?? 3;
   const oorCooldownHours = config.management.oorCooldownHours ?? 12;
   const recentDeploys = entry.deploys.slice(-oorTriggerCount);
