@@ -149,19 +149,19 @@ export function recordPoolDeploy(poolAddress, deployData) {
   }
 
   // ── Cooldown logic ──────────────────────────────────────────────
-  // Configurable cooldown hours (user-config.json or defaults)
-  const reEntryCooldownHours  = config.management.poolReentryCooldownHours ?? 4;
-  const slCooldownHours       = config.management.poolSlCooldownHours ?? 8;
+  // Configurable cooldown in MINUTES (user-config.json or defaults)
+  const reEntryCooldownMin = config.management.poolReentryCooldownMinutes ?? 240;  // default 4h
+  const slCooldownMin      = config.management.poolSlCooldownMinutes ?? 480;       // default 8h
 
   const closeReasonLower = String(deploy.close_reason || "").toLowerCase();
 
   // 1. Stop loss — long cooldown on both pool AND token (prevent re-entry via different pool)
   if (closeReasonLower.includes("stop loss")) {
-    const poolCd = setPoolCooldown(entry, slCooldownHours, "stop loss");
-    const mintCd = setBaseMintCooldown(db, entry.base_mint, slCooldownHours, "stop loss");
-    log("pool-memory", `SL cooldown set for ${entry.name} until ${poolCd}`);
+    const poolCd = setPoolCooldown(entry, slCooldownMin / 60, "stop loss");
+    const mintCd = setBaseMintCooldown(db, entry.base_mint, slCooldownMin / 60, "stop loss");
+    log("pool-memory", `SL cooldown set for ${entry.name} until ${poolCd} (${slCooldownMin}m)`);
     if (entry.base_mint && mintCd) {
-      log("pool-memory", `SL token cooldown set for ${entry.base_mint.slice(0, 8)} until ${mintCd}`);
+      log("pool-memory", `SL token cooldown set for ${entry.base_mint.slice(0, 8)} until ${mintCd} (${slCooldownMin}m)`);
     }
   }
   // 2. Low yield — medium cooldown (existing behavior)
@@ -174,8 +174,8 @@ export function recordPoolDeploy(poolAddress, deployData) {
   else {
     const currentCooldown = entry.cooldown_until ? new Date(entry.cooldown_until) : null;
     if (!currentCooldown || currentCooldown <= new Date()) {
-      const cooldownUntil = setPoolCooldown(entry, reEntryCooldownHours, "re-entry cooldown");
-      log("pool-memory", `Re-entry cooldown set for ${entry.name} until ${cooldownUntil}`);
+      const cooldownUntil = setPoolCooldown(entry, reEntryCooldownMin / 60, "re-entry cooldown");
+      log("pool-memory", `Re-entry cooldown set for ${entry.name} until ${cooldownUntil} (${reEntryCooldownMin}m)`);
     }
   }
 
