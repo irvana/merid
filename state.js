@@ -419,8 +419,11 @@ export function updatePnlAndCheckExits(position_address, positionData, mgmtConfi
 
   if (changed) save(state);
 
-  // ── Stop loss ──────────────────────────────────────────────────
-  if (!pnl_pct_suspicious && currentPnlPct != null && mgmtConfig.stopLossPct != null && currentPnlPct <= mgmtConfig.stopLossPct) {
+  // ── Stop loss (with age guard to skip initial settlement noise) ─
+  const minAgeSL = mgmtConfig.minAgeBeforeStopLoss ?? 0;
+  if (!pnl_pct_suspicious && currentPnlPct != null && mgmtConfig.stopLossPct != null
+      && currentPnlPct <= mgmtConfig.stopLossPct
+      && (positionData.age_minutes ?? Infinity) >= minAgeSL) {
     return {
       action: "STOP_LOSS",
       reason: `Stop loss: PnL ${currentPnlPct.toFixed(2)}% <= ${mgmtConfig.stopLossPct}%`,

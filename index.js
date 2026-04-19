@@ -242,10 +242,13 @@ export async function runManagementCycle({ silent = false } = {}) {
         return false;
       })();
 
-      // Rule 1: stop loss
+      // Rule 1: stop loss (with age guard to avoid triggering on initial settlement noise)
       if (!pnlSuspect && p.pnl_pct != null && p.pnl_pct <= config.management.stopLossPct) {
-        actionMap.set(p.position, { action: "CLOSE", rule: 1, reason: "stop loss" });
-        continue;
+        const minAgeSL = config.management.minAgeBeforeStopLoss ?? 0;
+        if ((p.age_minutes ?? Infinity) >= minAgeSL) {
+          actionMap.set(p.position, { action: "CLOSE", rule: 1, reason: "stop loss" });
+          continue;
+        }
       }
       // Rule 2: take profit
       if (!pnlSuspect && p.pnl_pct != null && p.pnl_pct >= config.management.takeProfitFeePct) {
