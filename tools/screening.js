@@ -115,8 +115,23 @@ export async function discoverPools({
  */
 export async function getTopCandidates({ limit = 10 } = {}) {
   const { config } = await import("../config.js");
-  const { pools } = await discoverPools({ page_size: 50 });
+  const { pools: rawPools } = await discoverPools({ page_size: 50 });
   const filteredOut = [];
+
+  // Dedup by pool_address — Meteora API can return the same pool twice per page
+  // (observed: AIB-SOL, chloe-SOL duplicating in single response). Without this,
+  // the same pool gets filter-dropped repeatedly, spamming bot-holder logs and
+  // wasting enrichment calls downstream.
+  const seenPools = new Set();
+  const pools = [];
+  let dedupCount = 0;
+  for (const p of rawPools) {
+    if (!p?.pool) continue;
+    if (seenPools.has(p.pool)) { dedupCount++; continue; }
+    seenPools.add(p.pool);
+    pools.push(p);
+  }
+  if (dedupCount > 0) log("screening", `Deduped ${dedupCount} duplicate pool(s) from discoverPools response`);
 
   // Exclude pools where the wallet already has an open position
   const { getMyPositions } = await import("./dlmm.js");
