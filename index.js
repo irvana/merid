@@ -612,7 +612,7 @@ IMPORTANT:
       });
     screenReport = content;
   } catch (error) {
-    log("cron_error", `Screening cycle failed: ${error.message}`);
+    log("cron_error", `Screening cycle failed: ${error.message}\nStack: ${error.stack}`);
     screenReport = `Screening cycle failed: ${error.message}`;
   } finally {
     _screeningBusy = false;
