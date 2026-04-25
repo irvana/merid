@@ -170,59 +170,118 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
     try {
       const activeModel = model || DEFAULT_MODEL;
 
-      // Retry up to 3 times on transient provider errors (502, 503, 529)
-      const FALLBACK_MODEL = "stepfun/step-3.5-flash:free";
-      let response;
+      // ── Model chain with fallback list ──────────────────────────────
+      // Build chain: [primary, ...fallbackListLLM] (deduped). On primary failure,
+      // iterate through fallbacks. Permanent errors (404/401/403/no-endpoints)
+      // immediately skip to next model. Transient errors (network/502/503/529)
+      // retry on same model up to 2× before skipping. If all exhausted → throw.
+      // Configure fallbackListLLM in user-config.json (array of model ids,
+      // discovered via scripts/llm-audit.js --free-only --top=15 and verified
+      // via --probe-model=...).
+      const fallbackList = Array.isArray(config.llm?.fallbackListLLM)
+        ? config.llm.fallbackListLLM
+        : (config.llm?.fallbackModel ? [config.llm.fallbackModel] : []);
+      const modelChain = [activeModel, ...fallbackList].filter((m, i, arr) => m && arr.indexOf(m) === i);
+
+      let response = null;
+      let lastError = null;
       let usedModel = activeModel;
       // Force a tool call on step 0 for action intents — prevents the model from inventing deploy/close outcomes
       const ACTION_INTENTS = /\b(deploy|open|add liquidity|close|exit|withdraw|claim|swap|block|unblock)\b/i;
       let toolChoice = (step === 0 && (ACTION_INTENTS.test(goal) || mustUseRealTool)) ? "required" : "auto";
 
-      for (let attempt = 0; attempt < 3; attempt++) {
-        try {
-          response = await client.chat.completions.create({
-            model: usedModel,
-            messages,
-            tools: getToolsForRole(agentType, goal),
-            tool_choice: toolChoice,
-            temperature: config.llm.temperature,
-            max_tokens: maxOutputTokens ?? config.llm.maxTokens,
-          });
-        } catch (error) {
-          if (providerMode === "system" && isSystemRoleError(error)) {
-            providerMode = "user_embedded";
-            messages = buildMessages(systemPrompt, sessionHistory, goal, providerMode);
-            log("agent", "Provider rejected system role — retrying with embedded system instructions");
-            attempt -= 1;
-            continue;
-          }
-          if (toolChoice === "required" && isToolChoiceRequiredError(error)) {
-            toolChoice = "auto";
-            log("agent", "Provider rejected tool_choice=required — retrying with tool_choice=auto");
-            attempt -= 1;
-            continue;
-          }
-          throw error;
+      modelLoop: for (let modelIdx = 0; modelIdx < modelChain.length; modelIdx++) {
+        usedModel = modelChain[modelIdx];
+        if (modelIdx > 0) {
+          log("agent", `Trying fallback model ${modelIdx}/${modelChain.length - 1}: ${usedModel}`);
         }
-        if (response.choices?.length) break;
-        const errCode = response.error?.code;
-        if (errCode === 502 || errCode === 503 || errCode === 529) {
-          const wait = (attempt + 1) * 5000;
-          if (attempt === 1 && usedModel !== FALLBACK_MODEL) {
-            usedModel = FALLBACK_MODEL;
-            log("agent", `Switching to fallback model ${FALLBACK_MODEL}`);
-          } else {
-            log("agent", `Provider error ${errCode}, retrying in ${wait / 1000}s (attempt ${attempt + 1}/3)`);
-            await new Promise((r) => setTimeout(r, wait));
+
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            response = await client.chat.completions.create({
+              model: usedModel,
+              messages,
+              tools: getToolsForRole(agentType, goal),
+              tool_choice: toolChoice,
+              temperature: config.llm.temperature,
+              max_tokens: maxOutputTokens ?? config.llm.maxTokens,
+            });
+          } catch (error) {
+            lastError = error;
+
+            // Provider-level retries (same model, doesn't count as model failure)
+            if (providerMode === "system" && isSystemRoleError(error)) {
+              providerMode = "user_embedded";
+              messages = buildMessages(systemPrompt, sessionHistory, goal, providerMode);
+              log("agent", "Provider rejected system role — retrying with embedded system instructions");
+              attempt -= 1;
+              continue;
+            }
+            if (toolChoice === "required" && isToolChoiceRequiredError(error)) {
+              toolChoice = "auto";
+              log("agent", "Provider rejected tool_choice=required — retrying with tool_choice=auto");
+              attempt -= 1;
+              continue;
+            }
+
+            const errMsg = String(error?.message || "");
+            const errStatus = error?.status || error?.response?.status;
+
+            // Permanent model errors — skip to next model in chain immediately
+            const isPermanent =
+              errStatus === 404 || errStatus === 401 || errStatus === 403 ||
+              errMsg.includes("No endpoints found") ||
+              errMsg.includes("model not found") ||
+              errMsg.toLowerCase().includes("does not exist");
+            if (isPermanent) {
+              log("agent", `Model ${usedModel} permanent error (${errStatus || "?"}): ${errMsg.slice(0, 120)} — skipping to next in chain`);
+              continue modelLoop;
+            }
+
+            // Transient network errors — retry same model with backoff
+            const isNetworkTransient =
+              error?.name === "FetchError" ||
+              error?.code === "ECONNRESET" ||
+              error?.code === "ETIMEDOUT" ||
+              error?.code === "EPIPE" ||
+              errMsg.includes("Premature close") ||
+              errMsg.includes("socket hang up") ||
+              errMsg.includes("network") ||
+              errMsg.includes("fetch failed");
+            if (isNetworkTransient && attempt < 1) {
+              const wait = (attempt + 1) * 3000;
+              log("agent", `Network transient on ${usedModel} (${error?.code || error?.name || "fetch"}): ${errMsg.slice(0, 100)} — retrying in ${wait/1000}s`);
+              await new Promise((r) => setTimeout(r, wait));
+              continue;
+            }
+
+            // Unknown error or retries exhausted — move to next model
+            log("agent", `Model ${usedModel} failed: ${errMsg.slice(0, 120)} — trying next in chain`);
+            continue modelLoop;
           }
-        } else {
-          break;
+
+          // Got a response object — check shape
+          if (response.choices?.length) break modelLoop; // SUCCESS
+
+          const errCode = response.error?.code;
+          if (errCode === 502 || errCode === 503 || errCode === 529) {
+            const wait = (attempt + 1) * 3000;
+            log("agent", `Provider transient ${errCode} on ${usedModel}, retrying in ${wait/1000}s (attempt ${attempt+1}/2)`);
+            await new Promise((r) => setTimeout(r, wait));
+            continue;
+          } else if (errCode === 404 || errCode === 401 || errCode === 403) {
+            log("agent", `Permanent error ${errCode} on ${usedModel} — skipping to next in chain`);
+            continue modelLoop;
+          } else {
+            log("agent", `Unrecognized error on ${usedModel}: code=${errCode} — trying next in chain`);
+            continue modelLoop;
+          }
         }
       }
 
-      if (!response.choices?.length) {
-        log("error", `Bad API response: ${JSON.stringify(response).slice(0, 200)}`);
-        throw new Error(`API returned no choices: ${response.error?.message || JSON.stringify(response)}`);
+      if (!response?.choices?.length) {
+        log("error", `All ${modelChain.length} models in chain exhausted: [${modelChain.join(", ")}]`);
+        throw lastError || new Error(`All ${modelChain.length} models exhausted without successful response. Last response: ${JSON.stringify(response).slice(0, 200)}`);
       }
       const msg = response.choices[0].message;
       // Repair malformed tool call JSON before pushing to history —

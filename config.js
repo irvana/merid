@@ -97,6 +97,15 @@ export const config = {
     managementModel: u.managementModel ?? process.env.LLM_MODEL ?? "openrouter/healer-alpha",
     screeningModel:  u.screeningModel  ?? process.env.LLM_MODEL ?? "openrouter/hunter-alpha",
     generalModel:    u.generalModel    ?? process.env.LLM_MODEL ?? "openrouter/healer-alpha",
+    // Fallback chain — agent.js iterates this list when primary fails.
+    // Permanent errors (404/401/403/no-endpoints) skip to next; transient
+    // (network/502/503/529) retry on same model first then move to next.
+    // Discover candidates: `node scripts/llm-audit.js --free-only --top=15`
+    // Probe each: `node scripts/llm-audit.js --probe-model=A,B,C`
+    // Set as array in user-config.json: "fallbackListLLM": ["model_a", "model_b", ...]
+    // Backward compat: if fallbackListLLM unset, falls back to fallbackModel (single id).
+    fallbackListLLM: Array.isArray(u.fallbackListLLM) ? u.fallbackListLLM : null,
+    fallbackModel:   u.fallbackModel   ?? null,
   },
 
   // ─── Common Token Mints ────────────────
