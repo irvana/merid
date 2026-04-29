@@ -159,9 +159,16 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
   // These lock after first attempt regardless of success — retrying them is always wrong
   const NO_RETRY_TOOLS = new Set(["deploy_position"]);
   const firedOnce = new Set();
+  // Track which tools were actually executed (success or fail) — used to catch
+  // small/fast models that emit "🚀 DEPLOYED" or "✓ CLOSED" templates from
+  // the prompt without calling the corresponding write tool. Pattern observed
+  // with qwen-turbo: skips deploy_position call but emits formatted final answer
+  // matching the prompt template, fooling Telegram into reporting fake deploys.
+  const toolsExecuted = new Set();
   const mustUseRealTool = shouldRequireRealToolUse(goal, agentType, requireTool);
   let sawToolCall = false;
   let noToolRetryCount = 0;
+  let hallucinationRetryCount = 0;
 
   let emptyStreak = 0;
   for (let step = 0; step < maxSteps; step++) {
@@ -331,6 +338,47 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           });
           continue;
         }
+
+        // ── Hallucination guard: claims action without calling the corresponding tool ──
+        // Pattern observed: small/fast models (qwen-turbo) follow the prompt template
+        // verbatim — emit "🚀 DEPLOYED <pool>" final answer without ever calling
+        // deploy_position. Same risk for "✓ CLOSED" / "CLAIMED" / "SWAPPED" templates.
+        // Detect mismatch between claimed action in text vs actual tool execution.
+        const content = String(msg.content || "");
+        const fabrications = [];
+        if (/🚀\s*DEPLOY(ED)?|^\s*DEPLOYED\b/im.test(content) && !toolsExecuted.has("deploy_position")) {
+          fabrications.push("DEPLOYED claim without deploy_position call");
+        }
+        if (/✓\s*CLOS(ED|ING)|^\s*CLOSED\b/im.test(content) && !toolsExecuted.has("close_position")) {
+          fabrications.push("CLOSED claim without close_position call");
+        }
+        if (/✓\s*CLAIM(ED)?|^\s*CLAIMED\b/im.test(content) && !toolsExecuted.has("claim_fees") && !toolsExecuted.has("close_position")) {
+          fabrications.push("CLAIMED claim without claim_fees/close_position call");
+        }
+        if (/✓\s*SWAP(PED)?|^\s*SWAPPED\b/im.test(content) && !toolsExecuted.has("swap_token") && !toolsExecuted.has("close_position")) {
+          fabrications.push("SWAPPED claim without swap_token call");
+        }
+        if (fabrications.length > 0) {
+          hallucinationRetryCount += 1;
+          messages.pop();
+          log("agent", `Rejected hallucinated final answer (${hallucinationRetryCount}/2): ${fabrications.join("; ")}`);
+          if (hallucinationRetryCount >= 2) {
+            return {
+              content: "NO DEPLOY — agent failed to commit a tool call after hallucination retries. Logged for review.",
+              userMessage: goal,
+            };
+          }
+          messages.push({
+            role: providerMode === "system" ? "system" : "user",
+            content: (providerMode === "system" ? "" : "[SYSTEM REMINDER]\n") +
+              "Your last response claimed an action (DEPLOYED/CLOSED/CLAIMED/SWAPPED) but you did NOT call the corresponding tool this session. " +
+              "This is fabrication — on-chain operations require actual tool calls. " +
+              "Either: (a) call the appropriate write tool now (deploy_position / close_position / claim_fees / swap_token), " +
+              "OR (b) honestly report 'NO DEPLOY' / 'HOLD' / 'STAY' and explain why. " +
+              "Do NOT emit success templates without an actual tool execution.",
+          });
+          continue;
+        }
         log("agent", "Final answer reached");
         log("agent", msg.content);
         return { content: msg.content, userMessage: goal };
@@ -380,6 +428,12 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           success: result?.success !== false && !result?.error && !result?.blocked,
           step,
         });
+
+        // Track for hallucination detection (any execution, success or fail).
+        // Only count true successes for the strict "claims X but didn't do X" check.
+        if (result?.success !== false && !result?.error && !result?.blocked) {
+          toolsExecuted.add(functionName);
+        }
 
         // Lock deploy_position after first attempt regardless of outcome — retrying is never right
         // For close/swap: only lock on success so genuine failures can be retried
